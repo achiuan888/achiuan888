@@ -1,0 +1,141 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+class BTC4HStrategy:
+    def __init__(self, data):
+        self.data = data
+        self.signals = None
+        self.results = None
+
+    def preprocess_data(self):
+        """Calculate indicators for the strategy."""
+        # Exponential Moving Averages
+        self.data['EMA9'] = self.data['Close'].ewm(span=9).mean()
+        self.data['EMA21'] = self.data['Close'].ewm(span=21).mean()
+
+        # ATR Calculation
+        high_low = self.data['High'] - self.data['Low']
+        high_close = np.abs(self.data['High'] - self.data['Close'].shift())
+        low_close = np.abs(self.data['Low'] - self.data['Close'].shift())
+        ranges = pd.concat([high_low, high_close, low_close], axis=1)
+        self.data['ATR'] = ranges.max(axis=1).rolling(window=14).mean()
+
+        # RSI Calculation
+        delta = self.data['Close'].diff()
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
+        avg_gain = pd.Series(gain).rolling(window=14).mean()
+        avg_loss = pd.Series(loss).rolling(window=14).mean()
+        rs = avg_gain / avg_loss
+        self.data['RSI'] = 100 - (100 / (1 + rs))
+
+    def generate_signals(self):
+        """Generate buy/sell signals based on EMA crossovers and RSI."""
+        self.data['Signal'] = 0
+
+        # Buy signals
+        buy_condition = (
+            (self.data['EMA9'] > self.data['EMA21']) &
+            (self.data['RSI'] > 30) &
+            (self.data['RSI'] < 70)
+        )
+        self.data.loc[buy_condition, 'Signal'] = 1
+
+        # Sell signals
+        sell_condition = (
+            (self.data['EMA9'] < self.data['EMA21']) &
+            (self.data['RSI'] > 70)
+        )
+        self.data.loc[sell_condition, 'Signal'] = -1
+
+        self.signals = self.data[['Close', 'Signal']]
+
+    def backtest(self, initial_capital=1000, atr_multiplier=1.5):
+        """Backtest the strategy with dynamic ATR stop loss and take profit."""
+        capital = initial_capital
+        position = 0
+        self.data['PnL'] = 0
+
+        for i in range(1, len(self.data)):
+            # Skip if no signal
+            if self.data['Signal'].iloc[i] == 0:
+                continue
+
+            # Buy Signal
+            if self.data['Signal'].iloc[i] == 1:
+                entry_price = self.data['Close'].iloc[i]
+                atr = self.data['ATR'].iloc[i]
+                stop_loss = entry_price - atr * atr_multiplier
+                take_profit = entry_price + atr * atr_multiplier
+
+                for j in range(i + 1, len(self.data)):
+                    high = self.data['High'].iloc[j]
+                    low = self.data['Low'].iloc[j]
+
+                    if low <= stop_loss:  # Stop loss hit
+                        pnl = (stop_loss - entry_price) * position
+                        self.data['PnL'].iloc[j] += pnl
+                        capital += pnl
+                        position = 0
+                        break
+                    elif high >= take_profit:  # Take profit hit
+                        pnl = (take_profit - entry_price) * position
+                        self.data['PnL'].iloc[j] += pnl
+                        capital += pnl
+                        position = 0
+                        break
+
+            # Sell Signal
+            elif self.data['Signal'].iloc[i] == -1:
+                entry_price = self.data['Close'].iloc[i]
+                atr = self.data['ATR'].iloc[i]
+                stop_loss = entry_price + atr * atr_multiplier
+                take_profit = entry_price - atr * atr_multiplier
+
+                for j in range(i + 1, len(self.data)):
+                    high = self.data['High'].iloc[j]
+                    low = self.data['Low'].iloc[j]
+
+                    if high >= stop_loss:  # Stop loss hit
+                        pnl = (entry_price - stop_loss) * position
+                        self.data['PnL'].iloc[j] += pnl
+                        capital += pnl
+                        position = 0
+                        break
+                    elif low <= take_profit:  # Take profit hit
+                        pnl = (entry_price - take_profit) * position
+                        self.data['PnL'].iloc[j] += pnl
+                        capital += pnl
+                        position = 0
+                        break
+
+        # Calculate total returns
+        self.data['Cumulative_PnL'] = self.data['PnL'].cumsum()
+        self.results = self.data[['Close', 'Signal', 'PnL', 'Cumulative_PnL']]
+        print(f"Final Capital: {capital}")
+
+    def plot_results(self):
+        """Plot the backtest results."""
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.data['Close'], label='BTC/USDT Price', alpha=0.5)
+        plt.plot(self.data['Cumulative_PnL'], label='Cumulative PnL', alpha=0.7)
+        plt.legend()
+        plt.title('4H BTC Strategy Backtest Results')
+        plt.xlabel('Date')
+        plt.ylabel('Price / PnL')
+        plt.grid()
+        plt.show()
+
+# 使用策略
+if __name__ == "__main__":
+    # 加載數據
+    file_path = "bitcoin_prices.csv"
+    data = pd.read_csv(file_path, parse_dates=['Timestamp'], index_col='Timestamp')
+
+    # 初始化策略
+    strategy = BTC4HStrategy(data)
+    strategy.preprocess_data()
+    strategy.generate_signals()
+    strategy.backtest()
+    strategy.plot_results()

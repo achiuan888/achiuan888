@@ -1,141 +1,101 @@
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
+import requests
+import time
+from datetime import datetime
 
-class BTC4HStrategy:
-    def __init__(self, data):
-        self.data = data
-        self.signals = None
-        self.results = None
+class BTC4HTradingBot:
+    def __init__(self, api_key, api_secret):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.symbol = "BTCUSDT"
+        self.interval = "4h"
+        self.leverage = 2
+        self.session = requests.Session()
+        self.headers = {
+            "X-MBX-APIKEY": self.api_key
+        }
 
-    def preprocess_data(self):
-        """Calculate indicators for the strategy."""
-        # Exponential Moving Averages
-        self.data['EMA9'] = self.data['Close'].ewm(span=9).mean()
-        self.data['EMA21'] = self.data['Close'].ewm(span=21).mean()
-
-        # ATR Calculation
-        high_low = self.data['High'] - self.data['Low']
-        high_close = np.abs(self.data['High'] - self.data['Close'].shift())
-        low_close = np.abs(self.data['Low'] - self.data['Close'].shift())
-        ranges = pd.concat([high_low, high_close, low_close], axis=1)
-        self.data['ATR'] = ranges.max(axis=1).rolling(window=14).mean()
-
-        # RSI Calculation
-        delta = self.data['Close'].diff()
+    def fetch_latest_data(self):
+        """獲取最新的 BTC/USDT K 線數據"""
+        url = "https://fapi.binance.com/fapi/v1/klines"
+        params = {
+            "symbol": self.symbol,
+            "interval": self.interval,
+            "limit": 100
+        }
+        response = self.session.get(url, params=params, headers=self.headers)
+        data = response.json()
+        df = pd.DataFrame(data, columns=[
+            "Timestamp", "Open", "High", "Low", "Close", "Volume", "CloseTime",
+            "QuoteAssetVolume", "NumberOfTrades", "TakerBuyBase", "TakerBuyQuote", "Ignore"])
+        df["Timestamp"] = pd.to_datetime(df["Timestamp"], unit="ms")
+        df.set_index("Timestamp", inplace=True)
+        df = df.astype(float)
+        return df
+    
+    def calculate_indicators(self, df):
+        """計算 EMA、ATR 和 RSI 指標"""
+        df["EMA9"] = df["Close"].ewm(span=9).mean()
+        df["EMA21"] = df["Close"].ewm(span=21).mean()
+        df["ATR"] = (df["High"] - df["Low"]).rolling(14).mean()
+        delta = df["Close"].diff()
         gain = np.where(delta > 0, delta, 0)
         loss = np.where(delta < 0, -delta, 0)
-        avg_gain = pd.Series(gain).rolling(window=14).mean()
-        avg_loss = pd.Series(loss).rolling(window=14).mean()
+        avg_gain = pd.Series(gain).rolling(14).mean()
+        avg_loss = pd.Series(loss).rolling(14).mean()
         rs = avg_gain / avg_loss
-        self.data['RSI'] = 100 - (100 / (1 + rs))
+        df["RSI"] = 100 - (100 / (1 + rs))
+        return df
 
-    def generate_signals(self):
-        """Generate buy/sell signals based on EMA crossovers and RSI."""
-        self.data['Signal'] = 0
+    def determine_signal(self, df):
+        """根據策略確定交易信號"""
+        latest = df.iloc[-1]
+        if latest["EMA9"] > latest["EMA21"] and 30 < latest["RSI"] < 70:
+            return "BUY"
+        elif latest["EMA9"] < latest["EMA21"] and latest["RSI"] > 70:
+            return "SELL"
+        return "HOLD"
 
-        # Buy signals
-        buy_condition = (
-            (self.data['EMA9'] > self.data['EMA21']) &
-            (self.data['RSI'] > 30) &
-            (self.data['RSI'] < 70)
-        )
-        self.data.loc[buy_condition, 'Signal'] = 1
+    def place_order(self, side, quantity):
+        """下單交易"""
+        url = "https://fapi.binance.com/fapi/v1/order"
+        params = {
+            "symbol": self.symbol,
+            "side": side,
+            "type": "MARKET",
+            "quantity": quantity,
+            "timestamp": int(time.time() * 1000)
+        }
+        response = self.session.post(url, params=params, headers=self.headers)
+        return response.json()
 
-        # Sell signals
-        sell_condition = (
-            (self.data['EMA9'] < self.data['EMA21']) &
-            (self.data['RSI'] > 70)
-        )
-        self.data.loc[sell_condition, 'Signal'] = -1
+    def run(self):
+        """運行交易機器人"""
+        print("交易機器人啟動...")
+        while True:
+            try:
+                df = self.fetch_latest_data()
+                df = self.calculate_indicators(df)
+                signal = self.determine_signal(df)
+                
+                if signal == "BUY":
+                    print("發現買入信號，執行多單...")
+                    self.place_order("BUY", 0.01)
+                elif signal == "SELL":
+                    print("發現賣出信號，執行空單...")
+                    self.place_order("SELL", 0.01)
+                else:
+                    print("暫無交易信號...")
+                
+                time.sleep(60 * 60 * 4)  # 等待4小時
+            except Exception as e:
+                print(f"運行出錯: {e}")
+                time.sleep(60)
 
-        self.signals = self.data[['Close', 'Signal']]
-
-    def backtest(self, initial_capital=1000, atr_multiplier=1.5):
-        """Backtest the strategy with dynamic ATR stop loss and take profit."""
-        capital = initial_capital
-        position = 0
-        self.data['PnL'] = 0
-
-        for i in range(1, len(self.data)):
-            # Skip if no signal
-            if self.data['Signal'].iloc[i] == 0:
-                continue
-
-            # Buy Signal
-            if self.data['Signal'].iloc[i] == 1:
-                entry_price = self.data['Close'].iloc[i]
-                atr = self.data['ATR'].iloc[i]
-                stop_loss = entry_price - atr * atr_multiplier
-                take_profit = entry_price + atr * atr_multiplier
-
-                for j in range(i + 1, len(self.data)):
-                    high = self.data['High'].iloc[j]
-                    low = self.data['Low'].iloc[j]
-
-                    if low <= stop_loss:  # Stop loss hit
-                        pnl = (stop_loss - entry_price) * position
-                        self.data['PnL'].iloc[j] += pnl
-                        capital += pnl
-                        position = 0
-                        break
-                    elif high >= take_profit:  # Take profit hit
-                        pnl = (take_profit - entry_price) * position
-                        self.data['PnL'].iloc[j] += pnl
-                        capital += pnl
-                        position = 0
-                        break
-
-            # Sell Signal
-            elif self.data['Signal'].iloc[i] == -1:
-                entry_price = self.data['Close'].iloc[i]
-                atr = self.data['ATR'].iloc[i]
-                stop_loss = entry_price + atr * atr_multiplier
-                take_profit = entry_price - atr * atr_multiplier
-
-                for j in range(i + 1, len(self.data)):
-                    high = self.data['High'].iloc[j]
-                    low = self.data['Low'].iloc[j]
-
-                    if high >= stop_loss:  # Stop loss hit
-                        pnl = (entry_price - stop_loss) * position
-                        self.data['PnL'].iloc[j] += pnl
-                        capital += pnl
-                        position = 0
-                        break
-                    elif low <= take_profit:  # Take profit hit
-                        pnl = (entry_price - take_profit) * position
-                        self.data['PnL'].iloc[j] += pnl
-                        capital += pnl
-                        position = 0
-                        break
-
-        # Calculate total returns
-        self.data['Cumulative_PnL'] = self.data['PnL'].cumsum()
-        self.results = self.data[['Close', 'Signal', 'PnL', 'Cumulative_PnL']]
-        print(f"Final Capital: {capital}")
-
-    def plot_results(self):
-        """Plot the backtest results."""
-        plt.figure(figsize=(12, 6))
-        plt.plot(self.data['Close'], label='BTC/USDT Price', alpha=0.5)
-        plt.plot(self.data['Cumulative_PnL'], label='Cumulative PnL', alpha=0.7)
-        plt.legend()
-        plt.title('4H BTC Strategy Backtest Results')
-        plt.xlabel('Date')
-        plt.ylabel('Price / PnL')
-        plt.grid()
-        plt.show()
-
-# 使用策略
+# 設置 API Key 並啟動機器人
 if __name__ == "__main__":
-    # 加載數據
-    file_path = "bitcoin_prices.csv"
-    data = pd.read_csv(file_path, parse_dates=['Timestamp'], index_col='Timestamp')
-
-    # 初始化策略
-    strategy = BTC4HStrategy(data)
-    strategy.preprocess_data()
-    strategy.generate_signals()
-    strategy.backtest()
-    strategy.plot_results()
+    API_KEY = "你的API_KEY"
+    API_SECRET = "你的API_SECRET"
+    bot = BTC4HTradingBot(API_KEY, API_SECRET)
+    bot.run()

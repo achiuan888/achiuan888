@@ -1,0 +1,118 @@
+import pandas as pd
+import numpy as np
+
+def calculate_bollinger_bands(df, period=20):
+    df['Middle_Band'] = df['Close'].rolling(window=period).mean()
+    df['Upper_Band'] = df['Middle_Band'] + 2 * df['Close'].rolling(window=period).std()
+    df['Lower_Band'] = df['Middle_Band'] - 2 * df['Close'].rolling(window=period).std()
+    return df
+
+def calculate_macd(df, fast=12, slow=26, signal=9):
+    df['EMA_Fast'] = df['Close'].ewm(span=fast, min_periods=1, adjust=False).mean()
+    df['EMA_Slow'] = df['Close'].ewm(span=slow, min_periods=1, adjust=False).mean()
+    df['MACD'] = df['EMA_Fast'] - df['EMA_Slow']
+    df['MACD_Signal'] = df['MACD'].ewm(span=signal, min_periods=1, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+    return df
+
+def calculate_atr(df, period=14):
+    df['High-Low'] = df['High'] - df['Low']
+    df['High-Close'] = abs(df['High'] - df['Close'].shift(1))
+    df['Low-Close'] = abs(df['Low'] - df['Close'].shift(1))
+    
+    tr = df[['High-Low', 'High-Close', 'Low-Close']].max(axis=1)
+    df['ATR'] = tr.rolling(window=period, min_periods=1).mean()
+    
+    return df.drop(columns=['High-Low', 'High-Close', 'Low-Close'])
+
+# 讀取數據
+file_path = "/mnt/data/bitcoin_prices.csv"
+df = pd.read_csv(file_path, parse_dates=['timestamp'])
+df.set_index('timestamp', inplace=True)
+
+df_optimized = df.resample('4H').agg({
+    'Open': 'first',
+    'High': 'max',
+    'Low': 'min',
+    'Close': 'last',
+    'Volume': 'sum'
+}).dropna()
+
+df_optimized = calculate_bollinger_bands(df_optimized)
+df_optimized = calculate_macd(df_optimized)
+df_optimized = calculate_atr(df_optimized)
+
+# 設定進場條件
+df_optimized['Long_Entry'] = (
+    (df_optimized['RSI'] < 30) &
+    (df_optimized['MACD_Hist'].diff() > 0) &
+    (df_optimized['Close'] < df_optimized['Lower_Band'])
+)
+
+df_optimized['Short_Entry'] = (
+    (df_optimized['RSI'] > 70) &
+    (df_optimized['MACD_Hist'].diff() < 0) &
+    (df_optimized['Close'] > df_optimized['Upper_Band'])
+)
+
+# 設定止盈/止損
+df_optimized['Long_StopLoss'] = df_optimized['Lower_Band'] - 1.5 * df_optimized['ATR']
+df_optimized['Short_StopLoss'] = df_optimized['Upper_Band'] + 1.5 * df_optimized['ATR']
+df_optimized['Long_TP'] = df_optimized['Middle_Band']
+df_optimized['Short_TP'] = df_optimized['Middle_Band']
+
+# 執行回測
+initial_balance = 10000
+balance = initial_balance
+position = 0
+entry_price = 0
+returns = []
+trade_executions = []
+
+for i in range(1, len(df_optimized)):
+    if position == 0:
+        if df_optimized.iloc[i]['Long_Entry']:
+            position = 1
+            entry_price = df_optimized.iloc[i]['Close']
+            stop_loss = df_optimized.iloc[i]['Long_StopLoss']
+            trade_executions.append(("BUY", df_optimized.index[i], entry_price))
+
+        elif df_optimized.iloc[i]['Short_Entry']:
+            position = -1
+            entry_price = df_optimized.iloc[i]['Close']
+            stop_loss = df_optimized.iloc[i]['Short_StopLoss']
+            trade_executions.append(("SELL", df_optimized.index[i], entry_price))
+
+    elif position == 1:
+        if df_optimized.iloc[i]['Low'] <= stop_loss:
+            balance *= (1 - 0.01)
+            position = 0
+        elif df_optimized.iloc[i]['High'] >= df_optimized.iloc[i]['Long_TP']:
+            balance *= (1 + 0.02)
+            position = 0
+
+    elif position == -1:
+        if df_optimized.iloc[i]['High'] >= stop_loss:
+            balance *= (1 - 0.01)
+            position = 0
+        elif df_optimized.iloc[i]['Low'] <= df_optimized.iloc[i]['Short_TP']:
+            balance *= (1 + 0.02)
+            position = 0
+
+    returns.append(balance)
+
+# 計算回測績效
+final_balance = balance
+total_return = (final_balance - initial_balance) / initial_balance * 100
+max_drawdown = (initial_balance - min(returns)) / initial_balance * 100
+win_rate = sum(df_optimized['Long_Entry'] | df_optimized['Short_Entry']) / len(df_optimized) * 100
+
+# 返回回測結果
+final_smart_money_backtest = {
+    "最終資金": final_balance,
+    "總回報率": total_return,
+    "最大回撤": max_drawdown,
+    "勝率": win_rate,
+    "交易數": len(trade_executions),
+    "樣本交易（前5筆）": trade_executions[:5]
+}
